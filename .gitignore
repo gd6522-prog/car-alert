@@ -1,0 +1,9 @@
+node_modules/
+logs/
+.env
+*.log
+
+# local secrets and runtime state
+kakao_tokens.json
+seen_state.json
+last_response.html
