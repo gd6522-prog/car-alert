@@ -121,7 +121,8 @@ function getStartReceivers() {
 }
 
 // ===== 엑셀 로드 =====
-// 컬럼: 차량번호 / 이름 / 직급 / 회사명 / 수신자(추가)
+// 시트1 컬럼: 차량번호 / 이름 / 직급 / 회사명 / 수신자1 / 수신자2 / ...
+// 시트2 컬럼: 이름 / 전화번호  (이름으로 조회해서 번호 변환)
 function loadFromXlsx() {
   if (!fs.existsSync(XLSX_PATH)) {
     console.error(`❌ 엑셀 파일 없음: ${XLSX_PATH}`);
@@ -130,6 +131,27 @@ function loadFromXlsx() {
   }
 
   const wb = XLSX.readFile(XLSX_PATH);
+
+  // 시트2: 이름 -> 전화번호 사전
+  const contactMap = {};
+  if (wb.SheetNames[1]) {
+    const ws2 = wb.Sheets[wb.SheetNames[1]];
+    const contactRows = XLSX.utils.sheet_to_json(ws2, { defval: "" });
+    for (const c of contactRows) {
+      const cName = String(c["이름"] || "").trim();
+      const cPhone = normPhone(String(c["전화번호"] || ""));
+      if (cName && cPhone) contactMap[cName] = cPhone;
+    }
+  }
+
+  // 이름 또는 전화번호를 전화번호로 변환
+  function resolvePhone(val) {
+    const s = String(val || "").trim();
+    if (!s) return "";
+    if (contactMap[s]) return contactMap[s]; // 이름이면 사전 조회
+    return normPhone(s); // 숫자면 그대로
+  }
+
   const sheetName = wb.SheetNames[0];
   const ws = wb.Sheets[sheetName];
   const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
@@ -137,7 +159,6 @@ function loadFromXlsx() {
   const vehicleMetaMap = {}; // 차량번호 -> {company, owner, receivers[]}
   const vehicles = [];
 
-  // 회사명별 수신자도 합치고 싶으면 (엑셀에서 같은 회사명 여러 줄이면 자동 누적)
   const companyReceiversMap = {}; // 회사명 -> Set(전화)
 
   for (const r of rows) {
@@ -148,25 +169,30 @@ function loadFromXlsx() {
     const role = String(r["직급"] || "").trim();
     const company = String(r["회사명"] || "").trim() || "-";
 
-    // ✅ 엑셀 수신자 컬럼
-    const receivers = parsePhones(r["수신자"]);
+    // 수신자1, 수신자2, ... 컬럼 수집 (이름 또는 번호 모두 허용)
+    const receivers = [];
+    for (const key of Object.keys(r)) {
+      if (/^수신자\d*$/.test(key)) {
+        const phone = resolvePhone(r[key]);
+        if (phone) receivers.push(phone);
+      }
+    }
 
     vehicleMetaMap[v] = {
       company,
       owner: `${name} ${role}`.trim() || "-",
-      receivers, // 차량별 수신자(있으면 우선)
+      receivers,
     };
 
     vehicles.push(v);
 
-    // 회사명 단위로도 누적(차량별 수신자 없을 때 회사 수신자 사용)
     if (!companyReceiversMap[company]) companyReceiversMap[company] = new Set();
     for (const p of receivers) companyReceiversMap[company].add(p);
   }
 
   if (!vehicles.length) {
     console.error("❌ 엑셀에서 차량번호를 하나도 못 읽었어요.");
-    console.error("   1행 헤더가 '차량번호/이름/직급/회사명/수신자'인지 확인해주세요.");
+    console.error("   시트1 헤더가 '차량번호/이름/직급/회사명/수신자1/수신자2/...'인지 확인해주세요.");
     process.exit(1);
   }
 
@@ -197,17 +223,17 @@ function loadFromXlsx() {
 }
 
 // ===== 출입로그 조회 =====
-async function fetchInOutRows() {
+async function fetchInOutRows({ vehicle = "", startDate = null } = {}) {
   const url = `${BASE_URL}/api/searchinoutlist.php`;
 
-  const start = ymd(dateMinus(2));
+  const start = startDate || ymd(dateMinus(2));
   const end = ymd(new Date());
 
   const form = new URLSearchParams();
   form.set("corp_sn", String(CORP_SN || "2"));
   form.set("startdate", start);
   form.set("enddate", end);
-  form.set("vehicle", "");
+  form.set("vehicle", vehicle);
   form.set("p", "1");
 
   const res = await axios.post(url, form, {
@@ -224,10 +250,12 @@ async function fetchInOutRows() {
     maxRedirects: 0,
   });
 
-  // 디버그 저장
-  try {
-    fs.writeFileSync(LAST_RESPONSE_PATH, String(res.data || ""), "utf-8");
-  } catch {}
+  // 디버그 저장 (전체 조회만)
+  if (!vehicle) {
+    try {
+      fs.writeFileSync(LAST_RESPONSE_PATH, String(res.data || ""), "utf-8");
+    } catch {}
+  }
 
   if (res.status === 302) {
     throw new Error("HTTP 302 (세션 만료/로그인 필요) → PHPSESSID 새로 교체하세요.");
@@ -419,13 +447,85 @@ async function sendNotifyTo(receivers, payload) {
   }
 }
 
+// ===== pending 출차 확인 (페이지 밀린 차량 전용) =====
+async function checkPendingExits(state, vehicleMetaMap, companyReceivers, watchSet) {
+  const pending = state.pending_out || {};
+  const keys = Object.keys(pending);
+  if (!keys.length) return;
+
+  for (const pendingKey of keys) {
+    const pipeIdx = pendingKey.indexOf("|");
+    const vehicleNo = pendingKey.slice(0, pipeIdx);
+    const inTime = pendingKey.slice(pipeIdx + 1);
+
+    // 감시 대상 아니면 제거
+    if (!watchSet.has(vehicleNo)) {
+      delete state.pending_out[pendingKey];
+      writeJson(STATE_PATH, state);
+      continue;
+    }
+
+    // 3일 초과 pending은 만료 처리
+    const addedAt = pending[pendingKey];
+    if (typeof addedAt === "number" && Date.now() - addedAt > 3 * 24 * 60 * 60 * 1000) {
+      console.log(`⏰ pending 만료(3일 초과): ${pendingKey}`);
+      delete state.pending_out[pendingKey];
+      writeJson(STATE_PATH, state);
+      continue;
+    }
+
+    // 입차 날짜 기준으로 해당 차량만 재조회
+    const inDate = inTime.split(" ")[0];
+
+    try {
+      const rows = await fetchInOutRows({ vehicle: vehicleNo, startDate: inDate });
+
+      for (const r of rows) {
+        if (r.vehicleNo !== vehicleNo) continue;
+        if ((r.inTime || "").trim() !== inTime) continue; // 같은 입차 기록만
+
+        if (r.outTime) {
+          const outKey = `${vehicleNo}|${r.outTime}`;
+          // pending 제거
+          delete state.pending_out[pendingKey];
+
+          if (!state.seen_out[outKey]) {
+            state.seen_out[outKey] = Date.now();
+            writeJson(STATE_PATH, state);
+
+            const meta = vehicleMetaMap[vehicleNo] || { company: "-", owner: "-", receivers: [] };
+            const receivers = resolveReceivers(vehicleNo, meta, companyReceivers);
+
+            const payload = {
+              company: meta.company,
+              vehicle: vehicleNo,
+              owner: meta.owner,
+              in_time: inTime,
+              out_time: r.outTime,
+            };
+
+            console.log(`🏁 [출차-추적] 수신자: ${receivers.join(",")}`);
+            await sendNotifyTo(receivers, payload);
+            console.log(`🏁 [출차-추적] 전송: ${outKey}`);
+          } else {
+            writeJson(STATE_PATH, state);
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`⚠️ pending 출차 확인 에러 (${vehicleNo}):`, e.message);
+    }
+  }
+}
+
 // ===== 감시 루프 =====
 async function runMonitor() {
   const { vehicleMetaMap, companyReceivers, watchSet } = loadFromXlsx();
 
-  const state = readJsonSafe(STATE_PATH, { seen_in: {}, seen_out: {} });
+  const state = readJsonSafe(STATE_PATH, { seen_in: {}, seen_out: {}, pending_out: {} });
   state.seen_in = state.seen_in || {};
   state.seen_out = state.seen_out || {};
+  state.pending_out = state.pending_out || {};
 
   const pollSec = Math.max(5, Number(POLL_SECONDS || 5));
 
@@ -482,10 +582,25 @@ async function runMonitor() {
             await sendNotifyTo(receivers, payload);
             console.log("🚗 [입차] 전송:", inKey);
           }
+
+          // 아직 출차 안 됐으면 pending 등록 (나중에 출차 추적용)
+          if (!r.outTime) {
+            const pendingKey = `${r.vehicleNo}|${r.inTime}`;
+            if (!state.pending_out[pendingKey]) {
+              state.pending_out[pendingKey] = Date.now();
+              writeJson(STATE_PATH, state);
+            }
+          }
         }
 
         // 출차 이벤트
         if (r.outTime) {
+          // pending에서 제거 (입차시간 기준으로 매칭)
+          const pendingKey = `${r.vehicleNo}|${r.inTime}`;
+          if (state.pending_out[pendingKey]) {
+            delete state.pending_out[pendingKey];
+          }
+
           const outKey = `${r.vehicleNo}|${r.outTime}`;
           if (!state.seen_out[outKey]) {
             state.seen_out[outKey] = Date.now();
@@ -508,6 +623,11 @@ async function runMonitor() {
 
       if (rows.length === 0) {
         console.log("⚠️ rows=0 입니다. last_response.html 확인 필요(로그인페이지/권한/형식변경 가능).");
+      }
+
+      // 페이지 밀린 차량 출차 추적
+      if (Object.keys(state.pending_out).length) {
+        await checkPendingExits(state, vehicleMetaMap, companyReceivers, watchSet);
       }
     } catch (e) {
       console.error("⚠️ 에러:", e.response?.data || e.message);
