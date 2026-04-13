@@ -15,7 +15,8 @@ const LAST_RESPONSE_PATH = path.join(__dirname, "last_response.html");
 // ===== ENV =====
 const {
   BASE_URL,
-  PHPSESSID,
+  LOGIN_ID,
+  LOGIN_PWD,
   CORP_SN,
   POLL_SECONDS,
 
@@ -45,13 +46,47 @@ const {
 } = process.env;
 
 // ===== 기본 체크 =====
-if (!BASE_URL || !PHPSESSID) {
-  console.error("❌ .env에 BASE_URL / PHPSESSID가 필요합니다.");
+if (!BASE_URL || !LOGIN_ID || !LOGIN_PWD) {
+  console.error("❌ .env에 BASE_URL / LOGIN_ID / LOGIN_PWD가 필요합니다.");
   process.exit(1);
 }
 if (!SOLAPI_API_KEY || !SOLAPI_API_SECRET) {
   console.error("❌ .env에 SOLAPI_API_KEY / SOLAPI_API_SECRET 가 필요합니다.");
   process.exit(1);
+}
+
+// ===== 세션 (자동 로그인으로 갱신) =====
+let currentSession = "";
+
+async function login() {
+  const form = new URLSearchParams();
+  form.set("mode", "login");
+  form.set("user_id", LOGIN_ID);
+  form.set("pwd", LOGIN_PWD);
+
+  const res = await axios.post(`${BASE_URL}/api/xp_login.php`, form, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 15000,
+    validateStatus: () => true,
+    maxRedirects: 0,
+  });
+
+  const body = String(res.data || "").trim();
+  if (body !== "success") {
+    throw new Error(`로그인 실패: ${body}`);
+  }
+
+  // Set-Cookie에서 PHPSESSID 추출
+  const cookies = [].concat(res.headers["set-cookie"] || []);
+  for (const c of cookies) {
+    const m = c.match(/PHPSESSID=([^;]+)/);
+    if (m) {
+      currentSession = m[1];
+      console.log("🔑 로그인 성공 (세션 갱신)");
+      return;
+    }
+  }
+  throw new Error("로그인은 됐으나 PHPSESSID를 찾을 수 없음");
 }
 
 // templateId는 SOLAPI_TEMPLATE_ID 우선, 없으면 SOLAPI_TEMPLATE_CODE 사용(호환)
@@ -243,7 +278,7 @@ async function fetchInOutRows({ vehicle = "", startDate = null } = {}) {
       "X-Requested-With": "XMLHttpRequest",
       Origin: BASE_URL,
       Referer: `${BASE_URL}/inoutlist`,
-      Cookie: `PHPSESSID=${PHPSESSID}`,
+      Cookie: `PHPSESSID=${currentSession}`,
     },
     timeout: 15000,
     validateStatus: () => true,
@@ -258,7 +293,9 @@ async function fetchInOutRows({ vehicle = "", startDate = null } = {}) {
   }
 
   if (res.status === 302) {
-    throw new Error("HTTP 302 (세션 만료/로그인 필요) → PHPSESSID 새로 교체하세요.");
+    console.log("⚠️ 세션 만료 → 자동 재로그인 시도...");
+    await login();
+    throw new Error("SESSION_EXPIRED"); // 호출부에서 재시도
   }
   if (res.status !== 200) throw new Error(`로그 API HTTP ${res.status}`);
 
@@ -529,6 +566,9 @@ async function runMonitor() {
 
   const pollSec = Math.max(5, Number(POLL_SECONDS || 5));
 
+  // 시작 시 자동 로그인
+  await login();
+
   console.log("✅ 감시 시작");
   console.log("감시 차량:", [...watchSet].join(", "));
   console.log(`주기: ${pollSec}초`);
@@ -630,8 +670,11 @@ async function runMonitor() {
         await checkPendingExits(state, vehicleMetaMap, companyReceivers, watchSet);
       }
     } catch (e) {
-      console.error("⚠️ 에러:", e.response?.data || e.message);
-      console.error("   (세션만료면 PHPSESSID 새 값으로 교체 필요)");
+      if (e.message === "SESSION_EXPIRED") {
+        console.log("🔄 세션 만료 → 다음 폴링에서 재시도");
+      } else {
+        console.error("⚠️ 에러:", e.response?.data || e.message);
+      }
     }
 
     await sleep(pollSec * 1000);
@@ -640,6 +683,7 @@ async function runMonitor() {
 
 // ===== 테스트(즉시 1건 발송) =====
 async function testSend() {
+  await login();
   const payload = {
     company: "화성센터",
     vehicle: "33마5154",
